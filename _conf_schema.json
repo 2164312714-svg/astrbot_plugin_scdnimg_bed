@@ -31,5 +31,17 @@
     "default": 60,
     "slider": {"min": 10, "max": 300, "step": 10},
     "hint": "上传大图片或视频时可能需要更长时间"
+  },
+  "local_upload_enabled": {
+    "description": "允许通过本地文件路径上传",
+    "type": "bool",
+    "default": false,
+    "hint": "出于安全考虑默认关闭。关闭后 /图床上传 不再接受本地文件路径，避免任意文件读取风险。"
+  },
+  "local_upload_root": {
+    "description": "本地文件上传白名单根目录",
+    "type": "string",
+    "default": "",
+    "hint": "开启 local_upload_enabled 后生效；留空表示不限制，建议设置为专门的图片目录以缩小可读范围。"
   }
 }

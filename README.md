@@ -44,6 +44,8 @@ https://github.com/2164312714-svg/astrbot_plugin_scdnimg_bed
 | `default_storage` | 枚举 | 默认存储后端 | `local` |
 | `default_output_format` | 枚举 | 默认输出格式，`auto` 表示由服务端自动处理 | `auto` |
 | `timeout` | 整数 | 单次请求超时时间，单位秒 | `60` |
+| `local_upload_enabled` | 布尔 | 是否允许通过本地文件路径上传（安全开关，默认关闭） | `false` |
+| `local_upload_root` | 字符串 | 本地文件上传白名单根目录，留空表示不限制 | `""` |
 
 ### 可选 CDN 域名
 
@@ -101,6 +103,8 @@ https://github.com/2164312714-svg/astrbot_plugin_scdnimg_bed
 ```
 
 **场景 D：本地文件路径**
+
+> 出于安全考虑默认关闭，需在插件配置中开启 `local_upload_enabled`，并可设置 `local_upload_root` 限制可读目录。
 
 ```
 /图床上传 C:\Users\Me\Pictures\cat.png

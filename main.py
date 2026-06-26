@@ -37,14 +37,32 @@ def _is_image_segment(seg) -> bool:
 
 def _extract_image_url_or_path(seg):
     """从图片消息段中提取 URL、文件路径或 base64 字符串。"""
-    if isinstance(seg, dict):
-        data = seg.get("data", {})
-        for key in ("url", "file", "path", "image_url", "src"):
-            value = data.get(key)
+    _URL_KEYS = ("url", "file", "path", "image_url", "src")
+
+    def _search_dict(d):
+        if not isinstance(d, dict):
+            return None
+        for key in _URL_KEYS:
+            value = d.get(key)
             if value:
                 return value
+        # 递归一层以兼容部分适配器的嵌套字段（如 NapCat 的 subType 包裹）
+        for value in d.values():
+            if isinstance(value, dict):
+                found = _search_dict(value)
+                if found:
+                    return found
         return None
-    for attr in ("url", "file", "path", "image_url", "src"):
+
+    if isinstance(seg, dict):
+        # 优先查 seg 顶层（部分实现把 url 直接放在段上）
+        value = _search_dict(seg)
+        if value:
+            return value
+        # 再查 data 子字段
+        data = seg.get("data", {})
+        return _search_dict(data)
+    for attr in _URL_KEYS:
         value = getattr(seg, attr, None)
         if value:
             return value
@@ -79,7 +97,18 @@ def _extract_scdn_identifier(text: str) -> str:
     return text
 
 
-_SCDN_LINK_RE = re.compile(r"https?://img\.scdn\.io/i/([^/\s]+)")
+_SCDN_HOSTS = (
+    "img.scdn.io",
+    "cloudflareimg.cdn.sn",
+    "edgeoneimg.cdn.sn",
+    "esaimg.cdn1.vip",
+    "cloudflarecnimg.scdn.io",
+    "anycastimg.scdn.io",
+    "edgeoneimg.cdn1.vip",
+)
+_SCDN_LINK_RE = re.compile(
+    r"https?://(?:" + "|".join(re.escape(h) for h in _SCDN_HOSTS) + r")/i/([^/\s]+)"
+)
 
 
 class ScdnImgBedPlugin(Star):
@@ -93,6 +122,8 @@ class ScdnImgBedPlugin(Star):
         self.default_storage: str = config.get("default_storage", "local")
         self.default_output_format: str = config.get("default_output_format", "auto")
         self.timeout: int = config.get("timeout", 60)
+        self.local_upload_enabled: bool = bool(config.get("local_upload_enabled", False))
+        self.local_upload_root: str = config.get("local_upload_root", "") or ""
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def initialize(self) -> None:
@@ -269,8 +300,18 @@ class ScdnImgBedPlugin(Star):
 
         reply_id = None
         for seg in message_chain:
-            if getattr(seg, "type", None) in ("Reply", "reply") and getattr(seg, "id", None):
-                reply_id = seg.id
+            if isinstance(seg, dict):
+                seg_type = seg.get("type")
+                seg_data = seg.get("data")
+                if isinstance(seg_data, dict):
+                    seg_id = seg_data.get("id") or seg.get("id")
+                else:
+                    seg_id = seg.get("id")
+            else:
+                seg_type = getattr(seg, "type", None)
+                seg_id = getattr(seg, "id", None)
+            if seg_type in ("Reply", "reply") and seg_id:
+                reply_id = seg_id
                 break
 
         platform = event.get_platform_name()
@@ -413,25 +454,37 @@ class ScdnImgBedPlugin(Star):
                 image_url = value
                 break
 
-            # 可能没有 url，尝试 base64（AstrBot 部分实现）
-            if image_url is None:
+            # 没有 url，尝试 base64 兜底
+            if isinstance(seg, Image):
                 try:
                     b64 = await seg.convert_to_base64()
-                    if b64:
-                        image_bytes = base64.b64decode(b64)
-                        image_filename = "image.bin"
-                        break
                 except Exception:
-                    pass
-                # 直接取 base64 字段
-                b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
+                    logger.debug("convert_to_base64 失败，尝试直接读取 base64 字段", exc_info=True)
+                    b64 = None
                 if b64:
                     try:
                         image_bytes = base64.b64decode(b64)
                         image_filename = "image.bin"
                         break
                     except Exception:
-                        pass
+                        logger.debug("base64 解码失败", exc_info=True)
+
+            # 直接取 base64 字段（dict 或对象均可能）
+            if isinstance(seg, dict):
+                data = seg.get("data", {})
+                if isinstance(data, dict):
+                    b64 = data.get("base64") or data.get("b64")
+                else:
+                    b64 = None
+            else:
+                b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
+            if b64:
+                try:
+                    image_bytes = base64.b64decode(b64)
+                    image_filename = "image.bin"
+                    break
+                except Exception:
+                    logger.debug("base64 字段解码失败", exc_info=True)
 
         # 尝试从引用/回复消息中提取图片
         if image_url is None and image_bytes is None:
@@ -480,15 +533,28 @@ class ScdnImgBedPlugin(Star):
                         yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
                         return
                 elif os.path.isfile(image_url):
-                    # 本地文件路径
+                    # 本地文件路径（受配置限制，防止任意文件读取）
+                    if not self.local_upload_enabled:
+                        yield event.plain_result("本地文件上传已被禁用，请在插件配置中开启 local_upload_enabled 后再使用。")
+                        return
+                    abs_path = os.path.abspath(image_url)
+                    if self.local_upload_root:
+                        root = os.path.abspath(self.local_upload_root)
+                        try:
+                            common = os.path.commonpath([root, abs_path])
+                        except ValueError:
+                            common = ""
+                        if common != root:
+                            yield event.plain_result("该文件路径不在允许的目录范围内。")
+                            return
                     try:
-                        with open(image_url, "rb") as f:
+                        with open(abs_path, "rb") as f:
                             image_bytes = f.read()
-                        image_filename = os.path.basename(image_url)
+                        image_filename = os.path.basename(abs_path)
                         result = await self._upload_file(image_bytes, image_filename, extra)
                     except Exception:
                         logger.error("读取本地图片文件失败", exc_info=True)
-                        yield event.plain_result("读取本地图片失败，请检查文件路径是否正确。")
+                        yield event.plain_result("读取本地图片失败，请检查文件路径或权限是否正确。")
                         return
                 else:
                     yield event.plain_result("不支持的图片地址，请提供 HTTP/HTTPS 链接、本地文件路径或 base64 data URI。")
