@@ -9,7 +9,7 @@
     "description": "默认 CDN 域名",
     "type": "string",
     "default": "img.scdn.io",
-    "hint": "可选：img.scdn.io / cloudflareimg.cdn.sn / edgeoneimg.cdn.sn / esaimg.cdn1.vip / cloudflarecnimg.scdn.io / anycastimg.scdn.io / edgeoneimg.cdn1.vip"
+    "hint": "可选：img.scdn.io / cloudflareimg.cdn.sn / edgeoneimg.cdn.sn / esaimg.cdn1.vip / cloudflarecnimg.scdn.io / anycastimg.scdn.io / edgeoneimg.cdn1.vip（完整列表以 main.py _SCDN_DOMAINS 为准，见 scripts/check_sync.py）"
   },
   "default_storage": {
     "description": "默认存储位置",

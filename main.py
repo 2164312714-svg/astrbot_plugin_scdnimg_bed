@@ -1,17 +1,50 @@
+import base64
+import json
 import os
 import re
-import json
-import base64
-import aiohttp
-from typing import Optional, Dict, Any
+import shlex
+from collections.abc import AsyncGenerator
+from typing import Any
 from urllib.parse import urlparse
 
+import aiohttp
+from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
-from astrbot.api.all import Star, Context, AstrBotConfig, logger, AstrMessageEvent
-from astrbot.api.all import Plain, Image
+
+__version__ = "v1.2.0"
+
+# 下载图片字节的大小上限，防止恶意链接耗尽内存
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+# 图片访问密码长度上限
+PASSWORD_MAX_LEN = 128
+
+# 支持的全部 scdn CDN 域名；/图床解析 需识别其中任意一个，而非仅 img.scdn.io
+# 注意：新增/删除域名需同步 _conf_schema.json 的 default_cdn_domain.hint 与
+#       README.md 的“可选 CDN 域名”章节（见 scripts/check_sync.py 校验）
+_SCDN_DOMAINS = (
+    "img.scdn.io",
+    "cloudflareimg.cdn.sn",
+    "edgeoneimg.cdn.sn",
+    "esaimg.cdn1.vip",
+    "cloudflarecnimg.scdn.io",
+    "anycastimg.scdn.io",
+    "edgeoneimg.cdn1.vip",
+)
+
+# 命令前缀剥离用的别名列表（含带 / 与不带 / 形式）；与 @filter.command 的 alias 保持一致
+_UPLOAD_ALIASES = ("/图床上传", "/上传图床", "/scdn-upload", "图床上传", "上传图床", "scdn-upload")
+_URL_ALIASES = ("/图床链接", "/上传图床链接", "/scdn-url", "图床链接", "上传图床链接", "scdn-url")
 
 
-def _get_message_chain(event: AstrMessageEvent):
+class ResponseParseError(RuntimeError):
+    """图床响应 JSON 解析失败，携带原始响应体前缀便于排查。"""
+
+    def __init__(self, message: str, body: str):
+        super().__init__(message)
+        self.body = body
+
+
+def _get_message_chain(event: AstrMessageEvent) -> list:
     """获取消息链，兼容 event.get_messages() 和 event.message_obj.message。"""
     try:
         return event.get_messages()
@@ -35,37 +68,63 @@ def _is_image_segment(seg) -> bool:
     return class_name == "Image"
 
 
-def _extract_image_url_or_path(seg):
+def _looks_like_url_or_data(value) -> bool:
+    """判断值是否是可直传的 http(s) URL 或 data URI。"""
+    return isinstance(value, str) and (
+        value.startswith("http://")
+        or value.startswith("https://")
+        or value.startswith("data:")
+    )
+
+
+def _extract_image_url_or_path(seg) -> str | None:
     """从图片消息段中提取 URL、文件路径或 base64 字符串。
 
     兼容 aiocqhttp/NapCat 不同版本的图片字段差异：对 data 下字段做多层下钻，
     提取失败时记录 logger.warning 以便定位适配问题。
+
+    注意：file/path 字段在部分平台是本地缓存名（如 {hash}.jpg）而非可下载 URL，
+    仅当其形似 http(s)/data 时才返回，避免被当成 URL 误传导致“不支持的图片地址”。
     """
     if isinstance(seg, dict):
         data = seg.get("data")
         if not isinstance(data, dict):
             data = {}
-        # 一级字段：经典 aiocqhttp 图片数据 {url, file, ...}
-        for key in ("url", "file", "path", "image_url", "src"):
+        # 一级：优先取可直接上传的 URL 字段
+        for key in ("url", "image_url", "src"):
             value = data.get(key)
             if value:
                 return value
-        # 二级字段：部分 NapCat 版本把 url/file 嵌套在 subType 等子对象下
+        # file/path 仅当形似 URL/data 时才用（避免本地缓存名被误当 URL）
+        for key in ("file", "path"):
+            value = data.get(key)
+            if _looks_like_url_or_data(value):
+                return value
+        # 二级：部分 NapCat 版本把 url/file 嵌套在 subType 等子对象下
         for sub in data.values():
             if not isinstance(sub, dict):
                 continue
-            for key in ("url", "file", "path", "image_url", "src"):
+            for key in ("url", "image_url", "src"):
                 value = sub.get(key)
                 if value:
                     return value
+            for key in ("file", "path"):
+                value = sub.get(key)
+                if _looks_like_url_or_data(value):
+                    return value
+        # 只记录 key 名不取值，避免泄露可能的敏感字段内容
         logger.warning(
-            "未能从图片消息段(dict)提取 URL/路径，data 字段：%s",
+            "未能从图片消息段(dict)提取 URL/路径，data 字段 keys：%s",
             list(data.keys()) if isinstance(data, dict) else data,
         )
         return None
-    for attr in ("url", "file", "path", "image_url", "src"):
+    for attr in ("url", "image_url", "src"):
         value = getattr(seg, attr, None)
         if value:
+            return value
+    for attr in ("file", "path"):
+        value = getattr(seg, attr, None)
+        if _looks_like_url_or_data(value):
             return value
     logger.warning("未能从图片消息段(%s)提取 URL/路径", type(seg).__name__)
     return None
@@ -99,16 +158,115 @@ def _extract_scdn_identifier(text: str) -> str:
     return text
 
 
-# 支持的全部 scdn CDN 域名；/图床解析 需识别其中任意一个，而非仅 img.scdn.io
-_SCDN_DOMAINS = (
-    "img.scdn.io",
-    "cloudflareimg.cdn.sn",
-    "edgeoneimg.cdn.sn",
-    "esaimg.cdn1.vip",
-    "cloudflarecnimg.scdn.io",
-    "anycastimg.scdn.io",
-    "edgeoneimg.cdn1.vip",
-)
+def _is_url(text: str) -> bool:
+    try:
+        parsed = urlparse(text)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def strip_command_prefix(raw_text: str, aliases) -> str:
+    """从 raw_text 中剥离命令前缀（兼容带 / 和不带 / 的情况）。"""
+    for prefix in aliases:
+        if raw_text.startswith(prefix):
+            return raw_text[len(prefix):].strip()
+    return raw_text
+
+
+def build_scdn_link_re(default_cdn_domain: str = "") -> "re.Pattern[str]":
+    """构建匹配 scdn 图片链接的正则，捕获组为标识符（不含 query/fragment）。"""
+    domains = set(_SCDN_DOMAINS)
+    if default_cdn_domain:
+        domains.add(default_cdn_domain)
+    domain_alt = "|".join(
+        re.escape(d) for d in sorted(domains, key=len, reverse=True)
+    )
+    return re.compile(rf"https?://(?:{domain_alt})/i/([^/?#\s]+)")
+
+
+def _parse_upload_args(raw_text: str) -> tuple[str, dict[str, str], str]:
+    """解析上传命令参数，返回 (url_or_empty, extra_dict, error_msg)。
+
+    支持 --k=v 与 --k v 两种形式（后者借助 shlex.split 支持引号包裹）。
+    """
+    try:
+        tokens = shlex.split(raw_text) if raw_text else []
+    except ValueError as e:
+        return "", {}, f"参数解析失败：{e}"
+
+    extra: dict[str, str] = {}
+    url = ""
+    option_map = {
+        "--format": "outputFormat",
+        "--cdn": "cdn_domain",
+        "--storage": "storage_destination",
+    }
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.startswith("--"):
+            # --k=v 形式
+            if "=" in token:
+                key, _, value = token.partition("=")
+            else:
+                # --k v 形式
+                key = token
+                if i + 1 >= len(tokens):
+                    return "", {}, f"参数 {token} 缺少值"
+                value = tokens[i + 1]
+                i += 1
+            if key == "--password":
+                if not value:
+                    return "", {}, "密码不能为空"
+                if len(value) > PASSWORD_MAX_LEN:
+                    return "", {}, f"密码长度超过 {PASSWORD_MAX_LEN}"
+                extra["password_enabled"] = "true"
+                extra["image_password"] = value
+            elif key in option_map:
+                if not value:
+                    return "", {}, f"{key} 的值不能为空"
+                extra[option_map[key]] = value
+            else:
+                return "", {}, f"未知参数: {token}"
+        elif not url and _is_url(_clean_url_or_query(token)):
+            url = _clean_url_or_query(token)
+        else:
+            return "", {}, f"无法识别的参数: {token}"
+        i += 1
+
+    return url, extra, ""
+
+
+async def _seg_to_bytes(seg) -> tuple[str | None, bytes | None, str | None]:
+    """从单个图片段提取 (url, bytes, filename)，先取 URL 再 base64 兜底。
+
+    把“先拿 URL、拿不到再 base64 兜底”的逻辑扁平化，供 upload_image 复用。
+    """
+    url = _extract_image_url_or_path(seg)
+    if url:
+        return url, None, None
+
+    b64 = None
+    if isinstance(seg, dict):
+        data = seg.get("data")
+        if isinstance(data, dict):
+            b64 = data.get("base64") or data.get("b64")
+    else:
+        if isinstance(seg, Image):
+            try:
+                b64 = await seg.convert_to_base64()
+            except Exception:
+                logger.warning("从图片段转换 base64 失败", exc_info=True)
+        if not b64:
+            b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
+    if b64:
+        try:
+            return None, base64.b64decode(b64), "image.bin"
+        except Exception:
+            logger.warning("解码图片 base64 失败", exc_info=True)
+    return None, None, None
 
 
 class ScdnImgBedPlugin(Star):
@@ -122,18 +280,21 @@ class ScdnImgBedPlugin(Star):
         self.default_storage: str = config.get("default_storage", "local")
         self.default_output_format: str = config.get("default_output_format", "auto")
         self.timeout: int = config.get("timeout", 60)
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: aiohttp.ClientSession | None = None
         # /图床解析 需识别全部已配置 CDN 域名，而不止 img.scdn.io
-        domains = set(_SCDN_DOMAINS)
-        if self.default_cdn_domain:
-            domains.add(self.default_cdn_domain)
-        domain_alt = "|".join(
-            re.escape(d) for d in sorted(domains, key=len, reverse=True)
+        self._scdn_link_re = build_scdn_link_re(self.default_cdn_domain)
+
+    def _new_session(self) -> aiohttp.ClientSession:
+        """统一创建带连接池、默认 UA 与超时的 ClientSession。"""
+        return aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=16),
+            headers={"User-Agent": f"scdnimg-bed/{__version__}"},
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
         )
-        self._scdn_link_re = re.compile(rf"https?://(?:{domain_alt})/i/([^/\s]+)")
 
     async def initialize(self) -> None:
-        self.session = aiohttp.ClientSession()
+        # 预热一次 session，统一经 _http_session() 取用
+        self.session = self._new_session()
         logger.info("scdnimg-bed 插件已初始化")
 
     async def terminate(self) -> None:
@@ -142,12 +303,13 @@ class ScdnImgBedPlugin(Star):
             logger.info("scdnimg-bed 插件会话已关闭")
 
     def _http_session(self) -> aiohttp.ClientSession:
+        # 唯一的 session 取用入口：为空或已关闭则重建
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = self._new_session()
         return self.session
 
-    def _build_upload_payload(self, extra: Dict[str, str] = None) -> Dict[str, str]:
-        data: Dict[str, str] = {}
+    def _build_upload_payload(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        data: dict[str, str] = {}
         if self.default_cdn_domain:
             data["cdn_domain"] = self.default_cdn_domain
         if self.default_storage:
@@ -160,7 +322,7 @@ class ScdnImgBedPlugin(Star):
         return data
 
     @staticmethod
-    def _format_upload_result(result: Dict[str, Any]) -> str:
+    def _format_upload_result(result: dict[str, Any]) -> str:
         url = result.get("url", "")
         data = result.get("data", {})
         lines = ["上传成功！", f"URL: {url}"]
@@ -183,7 +345,7 @@ class ScdnImgBedPlugin(Star):
         return "\n".join(lines)
 
     @staticmethod
-    def _format_query_result(result: Dict[str, Any]) -> str:
+    def _format_query_result(result: dict[str, Any]) -> str:
         data = result.get("data", {})
         lines = ["图片信息："]
         fields = [
@@ -211,110 +373,100 @@ class ScdnImgBedPlugin(Star):
             lines.append(f"{label}: {value}")
         return "\n".join(lines)
 
-    async def _upload_file(self, file_bytes: bytes, filename: str, extra: Dict[str, str]) -> Dict[str, Any]:
+    async def _request_json(self, method: str, **kwargs) -> dict[str, Any]:
+        """统一发起 HTTP 请求并解析 JSON，超时由 session 级配置统一管理。"""
+        async with self._http_session().request(
+            method, self.api_base_url, **kwargs
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                logger.error("图床响应 JSON 解析失败，body[:200]=%s", text[:200])
+                raise ResponseParseError(f"解析响应失败: {e}", text) from e
+
+    async def _upload_file(
+        self, file_bytes: bytes, filename: str, extra: dict[str, str]
+    ) -> dict[str, Any]:
         data = self._build_upload_payload(extra)
         form = aiohttp.FormData()
-        form.add_field("image", file_bytes, filename=filename, content_type="application/octet-stream")
+        form.add_field(
+            "image", file_bytes, filename=filename, content_type="application/octet-stream"
+        )
         for k, v in data.items():
             form.add_field(k, v)
+        return await self._request_json("POST", data=form)
 
-        async with self._http_session().post(
-            self.api_base_url,
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-        ) as resp:
-            resp.raise_for_status()
-            text = await resp.text()
-            try:
-                json_data = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"解析响应失败: {e}\n{text[:500]}") from e
-            return json_data
-
-    async def _upload_by_url(self, image_url: str, extra: Dict[str, str]) -> Dict[str, Any]:
+    async def _upload_by_url(self, image_url: str, extra: dict[str, str]) -> dict[str, Any]:
         data = self._build_upload_payload(extra)
         data["image_url"] = _clean_url_or_query(image_url)
+        return await self._request_json("POST", data=data)
 
-        async with self._http_session().post(
-            self.api_base_url,
-            data=data,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-        ) as resp:
-            resp.raise_for_status()
-            text = await resp.text()
-            try:
-                json_data = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"解析响应失败: {e}\n{text[:500]}") from e
-            return json_data
-
-    async def _query_image(self, query: str) -> Dict[str, Any]:
+    async def _query_image(self, query: str) -> dict[str, Any]:
         params = {"q": _extract_scdn_identifier(query)}
-        async with self._http_session().get(
-            self.api_base_url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-        ) as resp:
-            resp.raise_for_status()
-            text = await resp.text()
-            try:
-                json_data = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"解析响应失败: {e}\n{text[:500]}") from e
-            return json_data
+        return await self._request_json("GET", params=params)
 
-    def _parse_upload_args(self, raw_text: str) -> tuple:
-        """解析上传命令参数，返回 (url_or_empty, extra_dict, error_msg)。"""
-        tokens = raw_text.strip().split() if raw_text else []
-        extra: Dict[str, str] = {}
-        url = ""
+    async def _call_and_reply(
+        self,
+        event: AstrMessageEvent,
+        coro,
+        fmt_ok,
+        fail_msg: str = "操作失败，请稍后重试。",
+    ) -> AsyncGenerator[Any, None]:
+        """调用图床 API 并把结果格式化后回复，统一异常分流与错误信息上抛。
 
-        for token in tokens:
-            if token.startswith("--format="):
-                extra["outputFormat"] = token.split("=", 1)[1]
-            elif token.startswith("--cdn="):
-                extra["cdn_domain"] = token.split("=", 1)[1]
-            elif token.startswith("--storage="):
-                extra["storage_destination"] = token.split("=", 1)[1]
-            elif token.startswith("--password="):
-                pwd = token.split("=", 1)[1]
-                if pwd:
-                    extra["password_enabled"] = "true"
-                    extra["image_password"] = pwd
-            elif token.startswith("--"):
-                return "", {}, f"未知参数: {token}"
-            elif not url and self._is_url(_clean_url_or_query(token)):
-                url = _clean_url_or_query(token)
-            else:
-                return "", {}, f"无法识别的参数: {token}"
-
-        return url, extra, ""
-
-    @staticmethod
-    def _is_url(text: str) -> bool:
+        成功时 fmt_ok(result) 返回 str（纯文本）或 list（消息链，走 chain_result）。
+        """
         try:
-            parsed = urlparse(text)
-            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+            result = await coro
+        except aiohttp.ClientResponseError as e:
+            logger.error("图床 HTTP 错误 status=%s", e.status, extra={"status": e.status})
+            yield event.plain_result(f"图床返回 {e.status}：{e.message}")
+            return
+        except ResponseParseError as e:
+            logger.error("图床响应解析失败", exc_info=True)
+            yield event.plain_result(f"图床响应解析失败：{str(e)[:200]}")
+            return
         except Exception:
-            return False
+            logger.error("API 调用失败", exc_info=True)
+            yield event.plain_result(fail_msg)
+            return
+        if result.get("success"):
+            ok = fmt_ok(result)
+            if isinstance(ok, list):
+                yield event.chain_result(ok)
+            else:
+                yield event.plain_result(ok)
+        else:
+            err = result.get("message") or result.get("error") or "未知错误"
+            yield event.plain_result(f"操作失败：{err}")
 
-    async def _download_bytes(self, url: str) -> Optional[bytes]:
-        """下载 URL 内容为字节，供本地处理后上传。
+    async def _download_bytes(self, url: str) -> bytes | None:
+        """下载 URL 内容为字节（含大小封顶），供本地处理后上传。
 
         用于把含凭据（如 Telegram bot token）的下载链接在本地拉取，
         避免把该 URL 外发给第三方图床 API 造成凭据泄露。
         """
         try:
-            async with self._http_session().get(
-                url, timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as resp:
+            async with self._http_session().get(url) as resp:
                 resp.raise_for_status()
-                return await resp.read()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(1 << 16):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        logger.warning("下载内容超过上限 %s 字节，已取消", MAX_DOWNLOAD_BYTES)
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
         except Exception:
             logger.error("下载图片字节失败", exc_info=True)
             return None
 
-    async def _extract_reply_image(self, event: AstrMessageEvent) -> tuple:
+    async def _extract_reply_image(
+        self, event: AstrMessageEvent
+    ) -> tuple[str | None, bytes | None, str | None]:
         """尝试从引用/回复的消息中提取图片。返回 (url, bytes, filename)。
 
         filename 仅在返回 bytes 时有意义（可为 None，由调用方用默认名）。
@@ -383,9 +535,10 @@ class ScdnImgBedPlugin(Star):
                                 file_obj = await bot.get_file(file_id)
                                 file_path = getattr(file_obj, "file_path", None)
                                 if file_path:
-                                    token = getattr(getattr(bot, "session", None), "api_token", None)
+                                    bot_session = getattr(bot, "session", None)
+                                    token = getattr(bot_session, "api_token", None)
                                     if token:
-                                        # 本地下载字节后上传，避免把含 bot token 的 URL 外发给第三方图床 API
+                                        # 本地下载后上传，避免含 bot token 的 URL 外发给第三方图床
                                         dl_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
                                         image_bytes = await self._download_bytes(dl_url)
                                         if image_bytes:
@@ -420,7 +573,7 @@ class ScdnImgBedPlugin(Star):
         return None, None, None
 
     @staticmethod
-    def _extract_first_image_url(message_chain) -> Optional[str]:
+    def _extract_first_image_url(message_chain) -> str | None:
         """从消息链（dict/list 混合）中提取第一张图片的 URL 或路径。"""
         if isinstance(message_chain, dict):
             message_chain = message_chain.get("message", [])
@@ -435,7 +588,7 @@ class ScdnImgBedPlugin(Star):
         return None
 
     @staticmethod
-    def _extract_first_image_base64(message_chain) -> Optional[str]:
+    def _extract_first_image_base64(message_chain) -> str | None:
         """从消息链中提取第一张图片的 base64 字符串。"""
         if isinstance(message_chain, dict):
             message_chain = message_chain.get("message", [])
@@ -455,22 +608,21 @@ class ScdnImgBedPlugin(Star):
         return None
 
     @filter.command("图床上传", alias={"上传图床", "scdn-upload"})
-    async def upload_image(self, event: AstrMessageEvent):
+    async def upload_image(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """上传图片到 scdn 图床。支持回复图片、附带图片或提供图片 URL。
         用法：
           /图床上传（必须附带图片或回复图片消息）
-          /图床上传 <图片URL> [--format=webp] [--cdn=img.scdn.io] [--storage=local] [--password=密码]
+          /图床上传 <图片URL> [--format=webp] [--storage=local]
+          [--cdn=域名] [--password=密码]
         """
-        raw_text = event.get_message_str().strip()
-        # 去掉命令本身（兼容带 / 和不带 / 的情况）
-        for prefix in ("/图床上传", "/上传图床", "/scdn-upload", "图床上传", "上传图床", "scdn-upload"):
-            if raw_text.startswith(prefix):
-                raw_text = raw_text[len(prefix):].strip()
-                break
+        raw_text = strip_command_prefix(event.get_message_str().strip(), _UPLOAD_ALIASES)
 
-        arg_url, extra, error = self._parse_upload_args(raw_text)
+        arg_url, extra, error = _parse_upload_args(raw_text)
         if error:
-            yield event.plain_result(f"参数错误：{error}\n用法：/图床上传 [图片URL] [--format=webp] [--cdn=img.scdn.io] [--storage=local] [--password=密码]")
+            yield event.plain_result(
+                f"参数错误：{error}\n用法：/图床上传 [图片URL] [--format=webp] "
+                "[--cdn=img.scdn.io] [--storage=local] [--password=密码]"
+            )
             return
 
         # 优先从消息链/回复中提取图片
@@ -481,35 +633,14 @@ class ScdnImgBedPlugin(Star):
         for seg in _get_message_chain(event):
             if not _is_image_segment(seg):
                 continue
-
-            value = _extract_image_url_or_path(seg)
-            if value:
-                image_url = value
+            url, bts, fname = await _seg_to_bytes(seg)
+            if url:
+                image_url = url
                 break
-
-            # 当前段没有 URL/路径，尝试 base64 兜底
-            if value is None:
-                b64 = None
-                if isinstance(seg, dict):
-                    data = seg.get("data")
-                    if isinstance(data, dict):
-                        b64 = data.get("base64") or data.get("b64")
-                else:
-                    if isinstance(seg, Image):
-                        try:
-                            b64 = await seg.convert_to_base64()
-                        except Exception:
-                            logger.warning("从图片段转换 base64 失败", exc_info=True)
-                    if not b64:
-                        # 兼容直接携带 base64 字段的对象段
-                        b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
-                if b64:
-                    try:
-                        image_bytes = base64.b64decode(b64)
-                        image_filename = "image.bin"
-                        break
-                    except Exception:
-                        logger.warning("解码图片 base64 失败", exc_info=True)
+            if bts:
+                image_bytes = bts
+                image_filename = fname or "image.bin"
+                break
 
         # 尝试从引用/回复消息中提取图片
         if image_url is None and image_bytes is None:
@@ -523,112 +654,130 @@ class ScdnImgBedPlugin(Star):
         if image_url is None and image_bytes is None:
             # 没有附带图片，看看命令参数里是否提供了图片 URL
             if arg_url:
-                try:
-                    yield event.plain_result("正在通过 URL 上传图片，请稍候...")
-                    result = await self._upload_by_url(arg_url, extra)
-                    if result.get("success"):
-                        yield event.plain_result(self._format_upload_result(result))
-                    else:
-                        err = result.get("message") or result.get("error") or "未知错误"
-                        yield event.plain_result(f"上传失败：{err}")
-                except Exception:
-                    logger.error("图床 URL 上传失败", exc_info=True)
-                    yield event.plain_result("上传失败，请检查网络或图片链接后重试。")
+                yield event.plain_result("正在通过 URL 上传图片，请稍候...")
+                async for msg in self._call_and_reply(
+                    event,
+                    self._upload_by_url(arg_url, extra),
+                    self._format_upload_result,
+                    "上传失败，请检查网络或图片链接后重试。",
+                ):
+                    yield msg
                 return
 
-            yield event.plain_result("请发送/回复一张图片，或提供图片 URL。\n用法：/图床上传 [图片URL] [--format=webp] [--cdn=img.scdn.io] [--storage=local] [--password=密码]")
+            yield event.plain_result(
+                "请发送/回复一张图片，或提供图片 URL。\n用法：/图床上传 [图片URL] "
+                "[--format=webp] [--cdn=img.scdn.io] [--storage=local] [--password=密码]"
+            )
             return
 
         # 有图片 URL 或二进制
-        try:
-            yield event.plain_result("正在上传图片，请稍候...")
-            if image_url:
-                # 如果 URL 是 HTTP(S) 远端地址，直接用 URL 上传接口，避免下载
-                if self._is_url(image_url):
-                    result = await self._upload_by_url(image_url, extra)
-                elif image_url.startswith("data:"):
-                    # 部分平台可能给的是 base64 data URI
-                    try:
-                        encoded = image_url.split(",", 1)[1]
-                        image_bytes = base64.b64decode(encoded)
-                        image_filename = "image.bin"
-                        result = await self._upload_file(image_bytes, image_filename, extra)
-                    except Exception:
-                        logger.error("解析图片 data URI 失败", exc_info=True)
-                        yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
-                        return
-                else:
-                    yield event.plain_result("不支持的图片地址，请提供 HTTP/HTTPS 链接或 base64 data URI。")
+        if image_url:
+            if _is_url(image_url):
+                yield event.plain_result("正在上传图片，请稍候...")
+                async for msg in self._call_and_reply(
+                    event,
+                    self._upload_by_url(image_url, extra),
+                    self._format_upload_result,
+                    "上传失败，请检查网络或图片后重试。",
+                ):
+                    yield msg
+            elif image_url.startswith("data:"):
+                # 部分平台可能给的是 base64 data URI；用 partition 防无逗号越界
+                _scheme, _, encoded = image_url.partition(",")
+                if not encoded:
+                    yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
                     return
+                try:
+                    image_bytes = base64.b64decode(encoded)
+                    image_filename = "image.bin"
+                except Exception:
+                    logger.error("解析图片 data URI 失败", exc_info=True)
+                    yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
+                    return
+                yield event.plain_result("正在上传图片，请稍候...")
+                async for msg in self._call_and_reply(
+                    event,
+                    self._upload_file(image_bytes, image_filename, extra),
+                    self._format_upload_result,
+                    "上传失败，请检查网络或图片后重试。",
+                ):
+                    yield msg
             else:
-                result = await self._upload_file(image_bytes or b"", image_filename or "image.bin", extra)
-
-            if result.get("success"):
-                yield event.plain_result(self._format_upload_result(result))
-            else:
-                err = result.get("message") or result.get("error") or "未知错误"
-                yield event.plain_result(f"上传失败：{err}")
-        except Exception:
-            logger.error("图床上传失败", exc_info=True)
-            yield event.plain_result("上传失败，请检查网络或图片后重试。")
+                yield event.plain_result(
+                    "不支持的图片地址，请提供 HTTP/HTTPS 链接或 base64 data URI。"
+                )
+        else:
+            # 无 URL 时必须有有效字节，否则提前报错，避免上传空字节得到无意义 400
+            if not image_bytes:
+                yield event.plain_result("未获取到图片内容，请重新发送图片。")
+                return
+            yield event.plain_result("正在上传图片，请稍候...")
+            async for msg in self._call_and_reply(
+                event,
+                self._upload_file(image_bytes, image_filename or "image.bin", extra),
+                self._format_upload_result,
+                "上传失败，请检查网络或图片后重试。",
+            ):
+                yield msg
 
     @filter.command("图床链接", alias={"上传图床链接", "scdn-url"})
-    async def upload_image_url(self, event: AstrMessageEvent):
+    async def upload_image_url(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """通过图片 URL 上传到 scdn 图床。
         用法：/图床链接 <图片URL> [--format=webp] [--cdn=img.scdn.io] [--storage=local]
         """
-        raw_text = event.get_message_str().strip()
-        # 去掉命令本身（兼容带 / 和不带 / 的情况）
-        for prefix in ("/图床链接", "/上传图床链接", "/scdn-url", "图床链接", "上传图床链接", "scdn-url"):
-            if raw_text.startswith(prefix):
-                raw_text = raw_text[len(prefix):].strip()
-                break
+        raw_text = strip_command_prefix(event.get_message_str().strip(), _URL_ALIASES)
 
-        arg_url, extra, error = self._parse_upload_args(raw_text)
+        arg_url, extra, error = _parse_upload_args(raw_text)
         if error:
-            yield event.plain_result(f"参数错误：{error}\n用法：/图床链接 <图片URL> [--format=webp] [--cdn=img.scdn.io] [--storage=local]")
+            yield event.plain_result(
+                f"参数错误：{error}\n用法：/图床链接 <图片URL> "
+                "[--format=webp] [--cdn=img.scdn.io] [--storage=local]"
+            )
             return
         arg_url = _clean_url_or_query(arg_url)
         if not arg_url:
-            yield event.plain_result("请提供图片 URL。\n用法：/图床链接 <图片URL> [--format=webp] [--cdn=img.scdn.io] [--storage=local]")
+            yield event.plain_result(
+                "请提供图片 URL。\n用法：/图床链接 <图片URL> "
+                "[--format=webp] [--cdn=img.scdn.io] [--storage=local]"
+            )
             return
 
-        try:
-            yield event.plain_result("正在通过 URL 上传图片，请稍候...")
-            result = await self._upload_by_url(arg_url, extra)
-            if result.get("success"):
-                yield event.plain_result(self._format_upload_result(result))
-            else:
-                err = result.get("message") or result.get("error") or "未知错误"
-                yield event.plain_result(f"上传失败：{err}")
-        except Exception:
-            logger.error("图床 URL 上传失败", exc_info=True)
-            yield event.plain_result("上传失败，请检查网络或图片链接后重试。")
+        yield event.plain_result("正在通过 URL 上传图片，请稍候...")
+        async for msg in self._call_and_reply(
+            event,
+            self._upload_by_url(arg_url, extra),
+            self._format_upload_result,
+            "上传失败，请检查网络或图片链接后重试。",
+        ):
+            yield msg
 
     @filter.command("图床查询", alias={"查询图床", "scdn-info"})
-    async def query_image(self, event: AstrMessageEvent, query: str = ""):
+    async def query_image(
+        self, event: AstrMessageEvent, query: str = ""
+    ) -> AsyncGenerator[Any, None]:
         """查询 scdn 图床图片公开元数据。
         用法：/图床查询 <图片ID或文件名>
         """
         query = _extract_scdn_identifier(query)
         if not query:
-            yield event.plain_result("请提供图片 ID 或完整文件名。\n用法：/图床查询 <图片ID或文件名>")
+            yield event.plain_result(
+                "请提供图片 ID 或完整文件名。\n用法：/图床查询 <图片ID或文件名>"
+            )
             return
 
-        try:
-            yield event.plain_result("正在查询图片信息...")
-            result = await self._query_image(query)
-            if result.get("success"):
-                yield event.plain_result(self._format_query_result(result))
-            else:
-                err = result.get("message") or result.get("error") or "未知错误"
-                yield event.plain_result(f"查询失败：{err}")
-        except Exception:
-            logger.error("图床查询失败", exc_info=True)
-            yield event.plain_result("查询失败，请稍后重试。")
+        yield event.plain_result("正在查询图片信息...")
+        async for msg in self._call_and_reply(
+            event,
+            self._query_image(query),
+            self._format_query_result,
+            "查询失败，请稍后重试。",
+        ):
+            yield msg
 
     @filter.command("图床解析", alias={"解析图床", "scdn-parse", "scdn-send"})
-    async def parse_scdn_link(self, event: AstrMessageEvent, url: str = ""):
+    async def parse_scdn_link(
+        self, event: AstrMessageEvent, url: str = ""
+    ) -> AsyncGenerator[Any, None]:
         """解析 scdn 图片链接并将图片发送到群里。
         用法：/图床解析 <scdn图片URL>
         """
@@ -645,17 +794,9 @@ class ScdnImgBedPlugin(Star):
         scdn_url = match.group(0)
         identifier = match.group(1)
 
-        try:
-            yield event.plain_result("正在解析图片链接...")
-            result = await self._query_image(identifier)
-            if not result.get("success"):
-                err = result.get("message") or result.get("error") or "未知错误"
-                yield event.plain_result(f"解析失败：{err}")
-                return
-
+        def _fmt_parse(result: dict[str, Any]) -> list:
             data = result.get("data", {})
             image_url = data.get("image_url") or data.get("url") or scdn_url
-
             # 构建回复链：图片 + 简要信息
             chain = [Image.fromURL(image_url)]
             caption_parts = []
@@ -667,14 +808,19 @@ class ScdnImgBedPlugin(Star):
                 caption_parts.append(f"大小: {size}")
             if caption_parts:
                 chain.insert(0, Plain("\n".join(caption_parts)))
+            return chain
 
-            yield event.chain_result(chain)
-        except Exception:
-            logger.error("解析 scdn 链接失败", exc_info=True)
-            yield event.plain_result("解析失败，请稍后重试。")
+        yield event.plain_result("正在解析图片链接...")
+        async for msg in self._call_and_reply(
+            event,
+            self._query_image(identifier),
+            _fmt_parse,
+            "解析失败，请稍后重试。",
+        ):
+            yield msg
 
     @filter.command("图床帮助", alias={"scdn-help"})
-    async def help_cmd(self, event: AstrMessageEvent):
+    async def help_cmd(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         """显示 scdn 图床插件帮助。"""
         help_text = """scdn 图床插件帮助：
 
