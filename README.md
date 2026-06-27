@@ -55,6 +55,8 @@ https://github.com/2164312714-svg/astrbot_plugin_scdnimg_bed
 - `anycastimg.scdn.io`
 - `edgeoneimg.cdn1.vip`
 
+> 以上域名以 `main.py` 的 `_SCDN_DOMAINS` 为唯一来源；新增/删除域名需同步本列表与 `_conf_schema.json`，可用 `python scripts/check_sync.py` 校验。
+
 ### 存储后端说明
 
 - `local`：默认本地存储
@@ -234,6 +236,20 @@ ID: abc123
 
 ## 更新日志
 
+### v1.2.0
+
+> 本次为 issue #7 代码评审的全面整改（P0–P3）。
+
+- [严重] 修复 `/图床上传` `--password=` 空值被静默忽略的问题，现明确报“密码不能为空”
+- [严重] 修复 `_extract_image_url_or_path` 把 `file` 本地缓存名当 URL，导致部分 QQ/NapCat 图片上传失败
+- [严重] `/图床解析` 正则不再把 query/fragment 吞入标识符
+- [重构] 抽取 `_request_json` / `_call_and_reply` / `strip_command_prefix` 三个 helper，减少约 80 行重复
+- [重构] HTTP 层统一 `TCPConnector` + 默认 `User-Agent` + session 级超时，移除每请求重复构造
+- [安全] `_download_bytes` 增加下载大小封顶（50MB），防止恶意链接耗尽内存
+- [体验] `_parse_upload_args` 改用 `shlex`，支持 `--format webp` 空格形式与引号包裹
+- [体验] 错误信息上抛：HTTP 状态码、响应解析失败原因对用户可见（截断防泄露）
+- [工程] 新增 `tests/`（pytest）、`pyproject.toml`（ruff + mypy）、`scripts/check_sync.py`，补全类型注解
+
 ### v1.1.0
 
 - [安全] 移除 `/图床上传` 本地文件路径上传能力，彻底消除本地任意文件读取（LFI）风险
@@ -254,7 +270,18 @@ ID: abc123
 
 ## 依赖
 
-本插件仅依赖 AstrBot 内置 API，无需额外安装 Python 包。
+- 运行期仅依赖 AstrBot 内置 API 与其自带的 `aiohttp`，无需额外安装 Python 包。
+- 开发期（测试 / 静态检查）依赖：`pytest`、`ruff`、`mypy`、`aiohttp`。
+
+## 开发
+
+```bash
+pip install pytest ruff mypy aiohttp
+ruff check .
+mypy main.py
+pytest -q
+python scripts/check_sync.py   # 校验域名列表与版本号同步
+```
 
 ## 仓库与作者
 
