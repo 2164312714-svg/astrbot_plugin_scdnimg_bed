@@ -118,6 +118,20 @@ def test_call_and_reply_failure_result():
     assert event.results == [("plain", "操作失败：限额")]
 
 
+def test_call_and_reply_formatter_error_is_handled():
+    p = _make_plugin()
+    event = MockEvent()
+
+    async def coro():
+        return {"success": True, "data": []}
+
+    def bad_formatter(_result):
+        raise TypeError("bad shape")
+
+    _collect(p._call_and_reply(event, coro(), bad_formatter, "fail"))
+    assert event.results == [("plain", "操作成功，但解析返回内容失败。")]
+
+
 # ---- _seg_to_bytes (#12/#13) ----
 
 
@@ -181,6 +195,26 @@ def test_upload_image_url_rejects_data_uri():
     assert event.results == [
         ("plain", "图床链接仅支持 HTTP/HTTPS 图片链接；data URI 请使用 /图床上传。")
     ]
+
+
+def test_download_bytes_logs_without_sensitive_url(monkeypatch, caplog):
+    p = _make_plugin()
+    secret_url = "https://api.telegram.org/file/botSECRET_TOKEN/photos/file.jpg"
+
+    class FailingSession:
+        def get(self, url):
+            assert url == secret_url
+            raise RuntimeError(f"boom {url}")
+
+    monkeypatch.setattr(p, "_http_session", lambda: FailingSession())
+
+    with caplog.at_level("ERROR", logger="scdnimg-bed.test"):
+        result = asyncio.run(p._download_bytes(secret_url, "Telegram 图片"))
+
+    assert result is None
+    assert "SECRET_TOKEN" not in caplog.text
+    assert secret_url not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_query_image_extracts_arg_from_message_text():

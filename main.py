@@ -11,7 +11,7 @@ import aiohttp
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
 
-__version__ = "v1.2.1"
+__version__ = "v1.2.2"
 
 # 下载图片字节的大小上限，防止恶意链接耗尽内存
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -522,7 +522,12 @@ class ScdnImgBedPlugin(Star):
             yield event.plain_result(fail_msg)
             return
         if result.get("success"):
-            ok = fmt_ok(result)
+            try:
+                ok = fmt_ok(result)
+            except Exception:
+                logger.error("格式化图床响应失败", exc_info=True)
+                yield event.plain_result("操作成功，但解析返回内容失败。")
+                return
             if isinstance(ok, list):
                 yield event.chain_result(ok)
             else:
@@ -531,7 +536,7 @@ class ScdnImgBedPlugin(Star):
             err = result.get("message") or result.get("error") or "未知错误"
             yield event.plain_result(f"操作失败：{err}")
 
-    async def _download_bytes(self, url: str) -> bytes | None:
+    async def _download_bytes(self, url: str, log_label: str = "图片") -> bytes | None:
         """下载 URL 内容为字节（含大小封顶），供本地处理后上传。
 
         用于把含凭据（如 Telegram bot token）的下载链接在本地拉取，
@@ -549,9 +554,11 @@ class ScdnImgBedPlugin(Star):
                         return None
                     chunks.append(chunk)
                 return b"".join(chunks)
-        except Exception:
-            logger.error("下载图片字节失败", exc_info=True)
-            return None
+        except aiohttp.ClientResponseError as e:
+            logger.error("%s下载失败，HTTP status=%s", log_label, e.status)
+        except Exception as e:
+            logger.error("%s下载失败，error_type=%s", log_label, type(e).__name__)
+        return None
 
     async def _extract_reply_image(
         self, event: AstrMessageEvent
@@ -632,7 +639,9 @@ class ScdnImgBedPlugin(Star):
                                     if token:
                                         # 本地下载后上传，避免含 bot token 的 URL 外发给第三方图床
                                         dl_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-                                        image_bytes = await self._download_bytes(dl_url)
+                                        image_bytes = await self._download_bytes(
+                                            dl_url, "Telegram 图片"
+                                        )
                                         if image_bytes:
                                             ext = os.path.splitext(file_path)[1].lower() or ".jpg"
                                             return None, image_bytes, f"telegram{ext}"
