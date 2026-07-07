@@ -11,7 +11,7 @@ import aiohttp
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
 
-__version__ = "v1.2.0"
+__version__ = "v1.2.1"
 
 # 下载图片字节的大小上限，防止恶意链接耗尽内存
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
