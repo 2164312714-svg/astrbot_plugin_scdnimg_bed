@@ -21,8 +21,10 @@ def _make_plugin() -> ScdnImgBedPlugin:
 
 
 class MockEvent:
-    def __init__(self):
+    def __init__(self, message_str="", messages=None):
         self.results = []
+        self._message_str = message_str
+        self._messages = messages or []
 
     def plain_result(self, text):
         self.results.append(("plain", text))
@@ -31,6 +33,12 @@ class MockEvent:
     def chain_result(self, chain):
         self.results.append(("chain", chain))
         return chain
+
+    def get_message_str(self):
+        return self._message_str
+
+    def get_messages(self):
+        return self._messages
 
 
 def _collect(agen):
@@ -137,6 +145,79 @@ def test_seg_to_bytes_image_obj_no_b64():
 
     seg = Image()  # stub：无 url、convert_to_base64 返回 ""
     assert asyncio.run(_seg_to_bytes(seg)) == (None, None, None)
+
+
+def test_extract_first_image_base64_ignores_non_dict_data():
+    p = _make_plugin()
+    assert p._extract_first_image_base64([{"type": "image", "data": "bad"}]) is None
+
+
+# ---- command handlers ----
+
+
+def test_upload_image_accepts_data_uri_arg():
+    p = _make_plugin()
+    event = MockEvent("/图床上传 data:image/png;base64,cG5n")
+    seen = {}
+
+    async def fake_upload_file(file_bytes, filename, extra):
+        seen["file_bytes"] = file_bytes
+        seen["filename"] = filename
+        seen["extra"] = extra
+        return {"success": True, "url": "https://img.scdn.io/i/a.png"}
+
+    p._upload_file = fake_upload_file
+
+    _collect(p.upload_image(event))
+    assert seen == {"file_bytes": b"png", "filename": "image.bin", "extra": {}}
+    assert event.results[-1] == ("plain", "上传成功！\nURL: https://img.scdn.io/i/a.png")
+
+
+def test_upload_image_url_rejects_data_uri():
+    p = _make_plugin()
+    event = MockEvent("/图床链接 data:image/png;base64,cG5n")
+
+    _collect(p.upload_image_url(event))
+    assert event.results == [
+        ("plain", "图床链接仅支持 HTTP/HTTPS 图片链接；data URI 请使用 /图床上传。")
+    ]
+
+
+def test_query_image_extracts_arg_from_message_text():
+    p = _make_plugin()
+    event = MockEvent("/图床查询 https://img.scdn.io/i/a.webp?x=1")
+    seen = {}
+
+    async def fake_query_image(query):
+        seen["query"] = query
+        return {"success": True, "data": {"filename": "a.webp"}}
+
+    p._query_image = fake_query_image
+
+    _collect(p.query_image(event))
+    assert seen == {"query": "a.webp"}
+    assert event.results[-1] == ("plain", "图片信息：\n文件名: a.webp")
+
+
+def test_parse_scdn_link_extracts_arg_from_message_text_and_strips_quote():
+    p = _make_plugin()
+    raw = "/图床解析 https://img.scdn.io/i/a.webp [引用消息(用户:旧消息)]"
+    event = MockEvent(raw)
+    seen = {}
+
+    async def fake_query_image(query):
+        seen["query"] = query
+        return {
+            "success": True,
+            "data": {"filename": "a.webp", "image_url": "https://img.scdn.io/i/a.webp"},
+        }
+
+    p._query_image = fake_query_image
+
+    _collect(p.parse_scdn_link(event))
+    assert seen == {"query": "a.webp"}
+    assert event.results[0] == ("plain", "正在解析图片链接...")
+    assert event.results[1][0] == "chain"
 
 
 # ---- ResponseParseError ----

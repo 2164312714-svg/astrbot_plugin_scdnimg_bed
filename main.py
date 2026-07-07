@@ -34,6 +34,18 @@ _SCDN_DOMAINS = (
 # 命令前缀剥离用的别名列表（含带 / 与不带 / 形式）；与 @filter.command 的 alias 保持一致
 _UPLOAD_ALIASES = ("/图床上传", "/上传图床", "/scdn-upload", "图床上传", "上传图床", "scdn-upload")
 _URL_ALIASES = ("/图床链接", "/上传图床链接", "/scdn-url", "图床链接", "上传图床链接", "scdn-url")
+_QUERY_ALIASES = ("/图床查询", "/查询图床", "/scdn-info", "图床查询", "查询图床", "scdn-info")
+_PARSE_ALIASES = (
+    "/图床解析",
+    "/解析图床",
+    "/scdn-parse",
+    "/scdn-send",
+    "图床解析",
+    "解析图床",
+    "scdn-parse",
+    "scdn-send",
+)
+_MESSAGE_ARTIFACT_MARKERS = ("[引用消息(", "[回复消息(")
 
 
 class ResponseParseError(RuntimeError):
@@ -47,12 +59,17 @@ class ResponseParseError(RuntimeError):
 def _get_message_chain(event: AstrMessageEvent) -> list:
     """获取消息链，兼容 event.get_messages() 和 event.message_obj.message。"""
     try:
-        return event.get_messages()
+        messages = event.get_messages()
     except Exception:
         try:
-            return event.message_obj.message
+            messages = event.message_obj.message
         except Exception:
             return []
+    if isinstance(messages, list):
+        return messages
+    if isinstance(messages, tuple):
+        return list(messages)
+    return []
 
 
 def _is_image_segment(seg) -> bool:
@@ -130,7 +147,7 @@ def _extract_image_url_or_path(seg) -> str | None:
     return None
 
 
-def _clean_url_or_query(text: str) -> str:
+def _clean_url_or_query(text: str | None) -> str:
     """清理 URL/查询字符串，去除首尾空白、Markdown 反引号、尖括号等常见包裹符号。"""
     if not text:
         return ""
@@ -166,12 +183,82 @@ def _is_url(text: str) -> bool:
         return False
 
 
+def _is_data_uri(text: str) -> bool:
+    return isinstance(text, str) and text.lower().startswith("data:")
+
+
+def _decode_data_uri(data_uri: str) -> bytes | None:
+    """解码 base64 data URI，失败返回 None。"""
+    meta, sep, encoded = data_uri.partition(",")
+    if not sep or not encoded or ";base64" not in meta.lower():
+        return None
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except Exception:
+        logger.warning("解码图片 data URI 失败", exc_info=True)
+        return None
+    if len(image_bytes) > MAX_DOWNLOAD_BYTES:
+        logger.warning("图片 data URI 超过上限 %s 字节", MAX_DOWNLOAD_BYTES)
+        return None
+    return image_bytes
+
+
 def strip_command_prefix(raw_text: str, aliases) -> str:
     """从 raw_text 中剥离命令前缀（兼容带 / 和不带 / 的情况）。"""
     for prefix in aliases:
         if raw_text.startswith(prefix):
             return raw_text[len(prefix):].strip()
     return raw_text
+
+
+def _plain_text_from_segment(seg) -> str:
+    """从 Plain 消息段提取文本，跳过 Reply/Image 等非用户参数段。"""
+    if isinstance(seg, Plain):
+        return getattr(seg, "text", "") or ""
+
+    if isinstance(seg, dict):
+        if seg.get("type") not in ("Plain", "plain", "text"):
+            return ""
+        data = seg.get("data")
+        if isinstance(data, dict):
+            return str(data.get("text") or data.get("content") or "")
+        return str(data or seg.get("text") or "")
+
+    seg_type = getattr(seg, "type", None)
+    class_name = getattr(seg, "__class__", type(seg)).__name__
+    if seg_type in ("Plain", "plain", "text") or class_name == "Plain":
+        return str(getattr(seg, "text", None) or getattr(seg, "content", None) or "")
+    return ""
+
+
+def _strip_message_artifacts(raw_text: str) -> str:
+    """去掉 get_message_str 里混入的引用/回复展示串，避免被当成命令参数。"""
+    text = raw_text.strip()
+    artifact_positions = [
+        pos for marker in _MESSAGE_ARTIFACT_MARKERS if (pos := text.find(marker)) >= 0
+    ]
+    if artifact_positions:
+        text = text[: min(artifact_positions)].strip()
+    return text
+
+
+def _clean_command_arg_text(raw_text: str | None, aliases) -> str:
+    """清理一段命令文本：剥离命令前缀和框架消息展示串。"""
+    return _strip_message_artifacts(strip_command_prefix((raw_text or "").strip(), aliases))
+
+
+def _get_command_arg_text(event: AstrMessageEvent, aliases) -> str:
+    """提取命令后的纯文本参数，优先使用消息链中的 Plain 段。"""
+    plain_parts = [
+        text for seg in _get_message_chain(event) if (text := _plain_text_from_segment(seg))
+    ]
+    raw_text = " ".join(plain_parts).strip()
+    if not raw_text:
+        try:
+            raw_text = event.get_message_str().strip()
+        except Exception:
+            raw_text = ""
+    return _clean_command_arg_text(raw_text, aliases)
 
 
 def build_scdn_link_re(default_cdn_domain: str = "") -> "re.Pattern[str]":
@@ -230,7 +317,9 @@ def _parse_upload_args(raw_text: str) -> tuple[str, dict[str, str], str]:
                 extra[option_map[key]] = value
             else:
                 return "", {}, f"未知参数: {token}"
-        elif not url and _is_url(_clean_url_or_query(token)):
+        elif not url and (
+            _is_url(_clean_url_or_query(token)) or _is_data_uri(_clean_url_or_query(token))
+        ):
             url = _clean_url_or_query(token)
         else:
             return "", {}, f"无法识别的参数: {token}"
@@ -323,8 +412,8 @@ class ScdnImgBedPlugin(Star):
 
     @staticmethod
     def _format_upload_result(result: dict[str, Any]) -> str:
-        url = result.get("url", "")
         data = result.get("data", {})
+        url = result.get("url") or data.get("url") or data.get("image_url") or ""
         lines = ["上传成功！", f"URL: {url}"]
         filename = data.get("filename")
         if filename:
@@ -489,7 +578,10 @@ class ScdnImgBedPlugin(Star):
             if reply_id:
                 break
 
-        platform = event.get_platform_name()
+        try:
+            platform = event.get_platform_name()
+        except Exception:
+            platform = ""
 
         # aiocqhttp / QQ / NapCat：通过协议端 API 获取原消息
         if reply_id and platform == "aiocqhttp":
@@ -599,6 +691,8 @@ class ScdnImgBedPlugin(Star):
                 continue
             if isinstance(seg, dict):
                 data = seg.get("data", {})
+                if not isinstance(data, dict):
+                    continue
                 b64 = data.get("base64") or data.get("b64")
                 if b64:
                     return b64
@@ -615,7 +709,7 @@ class ScdnImgBedPlugin(Star):
           /图床上传 <图片URL> [--format=webp] [--storage=local]
           [--cdn=域名] [--password=密码]
         """
-        raw_text = strip_command_prefix(event.get_message_str().strip(), _UPLOAD_ALIASES)
+        raw_text = _get_command_arg_text(event, _UPLOAD_ALIASES)
 
         arg_url, extra, error = _parse_upload_args(raw_text)
         if error:
@@ -652,8 +746,22 @@ class ScdnImgBedPlugin(Star):
                 image_filename = reply_filename or "image.bin"
 
         if image_url is None and image_bytes is None:
-            # 没有附带图片，看看命令参数里是否提供了图片 URL
+            # 没有附带图片，看看命令参数里是否提供了图片 URL 或 data URI
             if arg_url:
+                if _is_data_uri(arg_url):
+                    image_bytes = _decode_data_uri(arg_url)
+                    if not image_bytes:
+                        yield event.plain_result("无法解析图片 data URI，请检查 base64 数据。")
+                        return
+                    yield event.plain_result("正在上传图片，请稍候...")
+                    async for msg in self._call_and_reply(
+                        event,
+                        self._upload_file(image_bytes, "image.bin", extra),
+                        self._format_upload_result,
+                        "上传失败，请检查网络或图片后重试。",
+                    ):
+                        yield msg
+                    return
                 yield event.plain_result("正在通过 URL 上传图片，请稍候...")
                 async for msg in self._call_and_reply(
                     event,
@@ -682,18 +790,12 @@ class ScdnImgBedPlugin(Star):
                 ):
                     yield msg
             elif image_url.startswith("data:"):
-                # 部分平台可能给的是 base64 data URI；用 partition 防无逗号越界
-                _scheme, _, encoded = image_url.partition(",")
-                if not encoded:
+                # 部分平台可能给的是 base64 data URI。
+                image_bytes = _decode_data_uri(image_url)
+                if not image_bytes:
                     yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
                     return
-                try:
-                    image_bytes = base64.b64decode(encoded)
-                    image_filename = "image.bin"
-                except Exception:
-                    logger.error("解析图片 data URI 失败", exc_info=True)
-                    yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
-                    return
+                image_filename = "image.bin"
                 yield event.plain_result("正在上传图片，请稍候...")
                 async for msg in self._call_and_reply(
                     event,
@@ -725,7 +827,7 @@ class ScdnImgBedPlugin(Star):
         """通过图片 URL 上传到 scdn 图床。
         用法：/图床链接 <图片URL> [--format=webp] [--cdn=img.scdn.io] [--storage=local]
         """
-        raw_text = strip_command_prefix(event.get_message_str().strip(), _URL_ALIASES)
+        raw_text = _get_command_arg_text(event, _URL_ALIASES)
 
         arg_url, extra, error = _parse_upload_args(raw_text)
         if error:
@@ -739,6 +841,11 @@ class ScdnImgBedPlugin(Star):
             yield event.plain_result(
                 "请提供图片 URL。\n用法：/图床链接 <图片URL> "
                 "[--format=webp] [--cdn=img.scdn.io] [--storage=local]"
+            )
+            return
+        if not _is_url(arg_url):
+            yield event.plain_result(
+                "图床链接仅支持 HTTP/HTTPS 图片链接；data URI 请使用 /图床上传。"
             )
             return
 
@@ -758,7 +865,8 @@ class ScdnImgBedPlugin(Star):
         """查询 scdn 图床图片公开元数据。
         用法：/图床查询 <图片ID或文件名>
         """
-        query = _extract_scdn_identifier(query)
+        query = query or _get_command_arg_text(event, _QUERY_ALIASES)
+        query = _extract_scdn_identifier(_clean_command_arg_text(query, _QUERY_ALIASES))
         if not query:
             yield event.plain_result(
                 "请提供图片 ID 或完整文件名。\n用法：/图床查询 <图片ID或文件名>"
@@ -781,6 +889,8 @@ class ScdnImgBedPlugin(Star):
         """解析 scdn 图片链接并将图片发送到群里。
         用法：/图床解析 <scdn图片URL>
         """
+        url = url or _get_command_arg_text(event, _PARSE_ALIASES)
+        url = _clean_command_arg_text(url, _PARSE_ALIASES)
         url = _clean_url_or_query(url)
         if not url:
             yield event.plain_result("请提供 scdn 图片链接。\n用法：/图床解析 <图片URL>")

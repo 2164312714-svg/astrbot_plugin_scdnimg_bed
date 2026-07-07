@@ -1,9 +1,15 @@
 """纯函数单测，覆盖 issue #8/#9/#10/#12 的回归。"""
 import main
 from main import (
+    _PARSE_ALIASES,
+    _QUERY_ALIASES,
+    _UPLOAD_ALIASES,
+    _clean_command_arg_text,
     _clean_url_or_query,
+    _decode_data_uri,
     _extract_image_url_or_path,
     _extract_scdn_identifier,
+    _get_command_arg_text,
     _is_url,
     _looks_like_url_or_data,
     _parse_upload_args,
@@ -98,6 +104,22 @@ def test_parse_shlex_quoted_value():  # #9 引号包裹含空格值
     assert extra["cdn_domain"] == "a.b.c"
 
 
+def test_parse_accepts_data_uri_source():
+    data_uri = "data:image/png;base64,cG5n"
+    url, extra, err = _parse_upload_args(f"{data_uri} --format=webp")
+    assert err == ""
+    assert url == data_uri
+    assert extra["outputFormat"] == "webp"
+
+
+def test_decode_data_uri_base64():
+    assert _decode_data_uri("data:image/png;base64,cG5n") == b"png"
+
+
+def test_decode_data_uri_rejects_non_base64():
+    assert _decode_data_uri("data:image/png,plain") is None
+
+
 # ---- build_scdn_link_re (#10) ----
 
 
@@ -132,6 +154,47 @@ def test_strip_prefix_without_slash():
 
 def test_strip_prefix_no_match():
     assert strip_command_prefix("hello", ("/图床上传",)) == "hello"
+
+
+class DummyEvent:
+    def __init__(self, message_str="", messages=None):
+        self._message_str = message_str
+        self._messages = messages or []
+
+    def get_message_str(self):
+        return self._message_str
+
+    def get_messages(self):
+        return self._messages
+
+
+def test_get_command_arg_text_prefers_plain_segments_over_quote_artifact():
+    event = DummyEvent(
+        "/图床上传 [引用消息(摆烂人生:用法：/图床上传 [图片URL])",
+        [
+            {"type": "Reply", "data": {"id": "1"}},
+            {"type": "Plain", "data": {"text": "/图床上传 --format=webp"}},
+        ],
+    )
+
+    assert _get_command_arg_text(event, _UPLOAD_ALIASES) == "--format=webp"
+
+
+def test_get_command_arg_text_strips_quote_artifact_fallback():
+    event = DummyEvent(
+        "/图床上传 [引用消息(摆烂人生:用法：/图床上传 [图片URL] [--format=webp])"
+    )
+
+    assert _get_command_arg_text(event, _UPLOAD_ALIASES) == ""
+
+
+def test_clean_command_arg_text_supports_query_alias():
+    assert _clean_command_arg_text("/查询图床 abc.webp", _QUERY_ALIASES) == "abc.webp"
+
+
+def test_clean_command_arg_text_supports_parse_alias_and_strips_quote():
+    raw = "/解析图床 https://img.scdn.io/i/a.webp [引用消息(用户:旧消息)]"
+    assert _clean_command_arg_text(raw, _PARSE_ALIASES) == "https://img.scdn.io/i/a.webp"
 
 
 # ---- _extract_image_url_or_path (#12) ----
