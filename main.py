@@ -11,7 +11,7 @@ import aiohttp
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
 
-__version__ = "v1.2.2"
+__version__ = "v1.2.3"
 
 # 下载图片字节的大小上限，防止恶意链接耗尽内存
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -467,8 +467,22 @@ class ScdnImgBedPlugin(Star):
         async with self._http_session().request(
             method, self.api_base_url, **kwargs
         ) as resp:
-            resp.raise_for_status()
             text = await resp.text()
+            if resp.status >= 400:
+                message = text[:200] or getattr(resp, "reason", "") or "HTTP 错误"
+                try:
+                    body = json.loads(text)
+                    if isinstance(body, dict):
+                        message = body.get("error") or body.get("message") or message
+                except json.JSONDecodeError:
+                    pass
+                raise aiohttp.ClientResponseError(
+                    resp.request_info,
+                    resp.history,
+                    status=resp.status,
+                    message=str(message)[:200],
+                    headers=resp.headers,
+                )
             try:
                 return json.loads(text)
             except json.JSONDecodeError as e:
@@ -491,6 +505,14 @@ class ScdnImgBedPlugin(Star):
         data = self._build_upload_payload(extra)
         data["image_url"] = _clean_url_or_query(image_url)
         return await self._request_json("POST", data=data)
+
+    async def _upload_downloaded_url(
+        self, image_url: str, extra: dict[str, str], filename: str = "image.bin"
+    ) -> dict[str, Any]:
+        image_bytes = await self._download_bytes(image_url, "图片")
+        if not image_bytes:
+            return {"success": False, "message": "未能下载图片内容，请重新发送图片或改用图片链接。"}
+        return await self._upload_file(image_bytes, filename, extra)
 
     async def _query_image(self, query: str) -> dict[str, Any]:
         params = {"q": _extract_scdn_identifier(query)}
@@ -793,7 +815,7 @@ class ScdnImgBedPlugin(Star):
                 yield event.plain_result("正在上传图片，请稍候...")
                 async for msg in self._call_and_reply(
                     event,
-                    self._upload_by_url(image_url, extra),
+                    self._upload_downloaded_url(image_url, extra),
                     self._format_upload_result,
                     "上传失败，请检查网络或图片后重试。",
                 ):

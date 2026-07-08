@@ -84,6 +84,47 @@ def test_call_and_reply_http_error():
     assert event.results == [("plain", "图床返回 500：boom")]
 
 
+def test_request_json_surfaces_scdn_error_body(monkeypatch):
+    p = _make_plugin()
+
+    class FakeResponse:
+        status = 400
+        headers = {}
+        request_info = None
+        history = ()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            raise aiohttp.ClientResponseError(
+                None, (), status=400, message="Bad Request", headers={}
+            )
+
+        async def text(self):
+            return '{"success":false,"error":"远程图片下载失败"}'
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(p, "_http_session", lambda: FakeSession())
+
+    async def call():
+        try:
+            await p._request_json("POST", data={"image_url": "https://x/a.png"})
+        except aiohttp.ClientResponseError as e:
+            return e
+        raise AssertionError("expected ClientResponseError")
+
+    err = asyncio.run(call())
+    assert err.status == 400
+    assert err.message == "远程图片下载失败"
+
+
 def test_call_and_reply_parse_error():
     p = _make_plugin()
     event = MockEvent()
@@ -185,6 +226,34 @@ def test_upload_image_accepts_data_uri_arg():
     _collect(p.upload_image(event))
     assert seen == {"file_bytes": b"png", "filename": "image.bin", "extra": {}}
     assert event.results[-1] == ("plain", "上传成功！\nURL: https://img.scdn.io/i/a.png")
+
+
+def test_upload_image_downloads_message_url_before_uploading_file():
+    p = _make_plugin()
+    event = MockEvent("/图床上传", [{"type": "image", "data": {"url": "https://qq.local/a.jpg"}}])
+    seen = {}
+
+    async def fake_download(url, log_label="图片"):
+        seen["download"] = (url, log_label)
+        return b"jpg-bytes"
+
+    async def fake_upload_file(file_bytes, filename, extra):
+        seen["upload_file"] = (file_bytes, filename, extra)
+        return {"success": True, "url": "https://img.scdn.io/i/a.webp"}
+
+    async def fake_upload_by_url(_image_url, _extra):
+        raise AssertionError("message image URL should not be sent directly to SCDN")
+
+    p._download_bytes = fake_download
+    p._upload_file = fake_upload_file
+    p._upload_by_url = fake_upload_by_url
+
+    _collect(p.upload_image(event))
+    assert seen == {
+        "download": ("https://qq.local/a.jpg", "图片"),
+        "upload_file": (b"jpg-bytes", "image.bin", {}),
+    }
+    assert event.results[-1] == ("plain", "上传成功！\nURL: https://img.scdn.io/i/a.webp")
 
 
 def test_upload_image_url_rejects_data_uri():
