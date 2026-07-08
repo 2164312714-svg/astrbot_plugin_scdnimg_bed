@@ -11,7 +11,7 @@ import aiohttp
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
 
-__version__ = "v1.2.3"
+__version__ = "v1.2.4"
 
 # 下载图片字节的大小上限，防止恶意链接耗尽内存
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -110,7 +110,7 @@ def _extract_image_url_or_path(seg) -> str | None:
         # 一级：优先取可直接上传的 URL 字段
         for key in ("url", "image_url", "src"):
             value = data.get(key)
-            if value:
+            if _looks_like_url_or_data(value):
                 return value
         # file/path 仅当形似 URL/data 时才用（避免本地缓存名被误当 URL）
         for key in ("file", "path"):
@@ -123,7 +123,7 @@ def _extract_image_url_or_path(seg) -> str | None:
                 continue
             for key in ("url", "image_url", "src"):
                 value = sub.get(key)
-                if value:
+                if _looks_like_url_or_data(value):
                     return value
             for key in ("file", "path"):
                 value = sub.get(key)
@@ -137,7 +137,7 @@ def _extract_image_url_or_path(seg) -> str | None:
         return None
     for attr in ("url", "image_url", "src"):
         value = getattr(seg, attr, None)
-        if value:
+        if _looks_like_url_or_data(value):
             return value
     for attr in ("file", "path"):
         value = getattr(seg, attr, None)
@@ -600,10 +600,19 @@ class ScdnImgBedPlugin(Star):
                     continue
                 data = seg.get("data")
                 reply_id = data.get("id") if isinstance(data, dict) else seg.get("id")
+                reply_chain = data.get("message") if isinstance(data, dict) else None
             else:
                 if getattr(seg, "type", None) not in ("Reply", "reply"):
                     continue
                 reply_id = getattr(seg, "id", None)
+                reply_chain = getattr(seg, "chain", None)
+            if reply_chain:
+                url = self._extract_first_image_url(reply_chain)
+                if url:
+                    return url, None, None
+                b64 = self._extract_first_image_base64(reply_chain)
+                if b64:
+                    return None, base64.b64decode(b64), None
             if reply_id:
                 break
 
@@ -612,8 +621,8 @@ class ScdnImgBedPlugin(Star):
         except Exception:
             platform = ""
 
-        # aiocqhttp / QQ / NapCat：通过协议端 API 获取原消息
-        if reply_id and platform == "aiocqhttp":
+        # OneBot / QQ / NapCat：通过协议端 API 获取原消息；平台名可能不是 aiocqhttp。
+        if reply_id:
             try:
                 bot = getattr(event, "bot", None)
                 api = getattr(bot, "api", None)
@@ -638,7 +647,7 @@ class ScdnImgBedPlugin(Star):
                         if b64:
                             return None, base64.b64decode(b64), None
             except Exception:
-                logger.error("aiocqhttp 提取引用消息图片失败", exc_info=True)
+                logger.error("OneBot 提取引用消息图片失败", exc_info=True)
 
         # Telegram：从 raw_message.reply_to_message 中提取最大尺寸图片
         if platform == "telegram":
@@ -672,7 +681,7 @@ class ScdnImgBedPlugin(Star):
 
         # 通用兜底：尝试从 raw_message 的常见字段找回复消息中的图片
         try:
-            raw = getattr(event.message_obj, "raw_message", None)
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
             if raw and isinstance(raw, dict):
                 for key in ("reply_to_message", "reply", "quoted_message", "source"):
                     replied = raw.get(key)

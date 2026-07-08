@@ -21,10 +21,11 @@ def _make_plugin() -> ScdnImgBedPlugin:
 
 
 class MockEvent:
-    def __init__(self, message_str="", messages=None):
+    def __init__(self, message_str="", messages=None, platform_name=""):
         self.results = []
         self._message_str = message_str
         self._messages = messages or []
+        self._platform_name = platform_name
 
     def plain_result(self, text):
         self.results.append(("plain", text))
@@ -39,6 +40,9 @@ class MockEvent:
 
     def get_messages(self):
         return self._messages
+
+    def get_platform_name(self):
+        return self._platform_name
 
 
 def _collect(agen):
@@ -202,6 +206,18 @@ def test_seg_to_bytes_image_obj_no_b64():
     assert asyncio.run(_seg_to_bytes(seg)) == (None, None, None)
 
 
+def test_seg_to_bytes_ignores_non_http_image_url_and_uses_base64():
+    from main import Image
+
+    class LocalImage(Image):
+        url = "file:///cache/image.jpg"
+
+        async def convert_to_base64(self):
+            return base64.b64encode(b"local-image").decode()
+
+    assert asyncio.run(_seg_to_bytes(LocalImage())) == (None, b"local-image", "image.bin")
+
+
 def test_extract_first_image_base64_ignores_non_dict_data():
     p = _make_plugin()
     assert p._extract_first_image_base64([{"type": "image", "data": "bad"}]) is None
@@ -254,6 +270,44 @@ def test_upload_image_downloads_message_url_before_uploading_file():
         "upload_file": (b"jpg-bytes", "image.bin", {}),
     }
     assert event.results[-1] == ("plain", "上传成功！\nURL: https://img.scdn.io/i/a.webp")
+
+
+def test_upload_image_reply_uses_onebot_get_msg_even_when_platform_name_differs():
+    p = _make_plugin()
+    event = MockEvent(
+        "/图床上传",
+        [{"type": "Reply", "data": {"id": "123"}}],
+        platform_name="napcat",
+    )
+    seen = {}
+
+    class FakeApi:
+        async def call_action(self, action, **kwargs):
+            seen["call_action"] = (action, kwargs)
+            return {"message": [{"type": "image", "data": {"url": "https://qq.local/reply.jpg"}}]}
+
+    class FakeBot:
+        api = FakeApi()
+
+    async def fake_download(url, log_label="图片"):
+        seen["download"] = (url, log_label)
+        return b"reply-bytes"
+
+    async def fake_upload_file(file_bytes, filename, extra):
+        seen["upload_file"] = (file_bytes, filename, extra)
+        return {"success": True, "url": "https://img.scdn.io/i/reply.webp"}
+
+    event.bot = FakeBot()
+    p._download_bytes = fake_download
+    p._upload_file = fake_upload_file
+
+    _collect(p.upload_image(event))
+    assert seen == {
+        "call_action": ("get_msg", {"message_id": 123}),
+        "download": ("https://qq.local/reply.jpg", "图片"),
+        "upload_file": (b"reply-bytes", "image.bin", {}),
+    }
+    assert event.results[-1] == ("plain", "上传成功！\nURL: https://img.scdn.io/i/reply.webp")
 
 
 def test_upload_image_url_rejects_data_uri():
