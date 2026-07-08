@@ -28,7 +28,7 @@
   "timeout": {
     "description": "请求超时时间（秒）",
     "type": "int",
-    "default": 60,
+    "default": 120,
     "slider": {"min": 10, "max": 300, "step": 10},
     "hint": "上传大图片或视频时可能需要更长时间"
   }

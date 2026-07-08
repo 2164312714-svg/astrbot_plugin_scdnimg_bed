@@ -11,7 +11,7 @@ import aiohttp
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, Context, Image, Plain, Star, logger
 from astrbot.api.event import filter
 
-__version__ = "v1.2.4"
+__version__ = "v1.2.5"
 
 # 下载图片字节的大小上限，防止恶意链接耗尽内存
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -368,7 +368,7 @@ class ScdnImgBedPlugin(Star):
         self.default_cdn_domain: str = config.get("default_cdn_domain", "img.scdn.io")
         self.default_storage: str = config.get("default_storage", "local")
         self.default_output_format: str = config.get("default_output_format", "auto")
-        self.timeout: int = config.get("timeout", 60)
+        self.timeout: int = config.get("timeout", 120)
         self.session: aiohttp.ClientSession | None = None
         # /图床解析 需识别全部已配置 CDN 域名，而不止 img.scdn.io
         self._scdn_link_re = build_scdn_link_re(self.default_cdn_domain)
@@ -538,6 +538,10 @@ class ScdnImgBedPlugin(Star):
         except ResponseParseError as e:
             logger.error("图床响应解析失败", exc_info=True)
             yield event.plain_result(f"图床响应解析失败：{str(e)[:200]}")
+            return
+        except TimeoutError:
+            logger.error("图床 API 调用超时，timeout=%s", self.timeout)
+            yield event.plain_result("上传图床超时，请稍后重试或在插件配置中调大 timeout。")
             return
         except Exception:
             logger.error("API 调用失败", exc_info=True)

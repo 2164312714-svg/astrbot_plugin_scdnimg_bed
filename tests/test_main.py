@@ -141,6 +141,17 @@ def test_call_and_reply_parse_error():
     assert "图床响应解析失败" in event.results[0][1]
 
 
+def test_call_and_reply_timeout_error():
+    p = _make_plugin()
+    event = MockEvent()
+
+    async def coro():
+        raise TimeoutError()
+
+    _collect(p._call_and_reply(event, coro(), lambda r: "ok", "fail"))
+    assert event.results == [("plain", "上传图床超时，请稍后重试或在插件配置中调大 timeout。")]
+
+
 def test_call_and_reply_unknown_error():
     p = _make_plugin()
     event = MockEvent()
